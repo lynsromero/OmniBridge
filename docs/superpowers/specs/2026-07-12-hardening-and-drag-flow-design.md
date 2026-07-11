@@ -12,6 +12,7 @@ Three sub-projects to take OmniBridge from demo-quality pipeline to functional c
 | 1. Fix Data Path | Binary protocol + real codec + chunking | 1080p streaming at 30fps over UDP |
 | 2. Complete Drag Flow | Edge-crossing window drag | Drag window to edge → appears on other device |
 | 3. Harden & Scale | Multi-monitor + connection mgmt | Works on real multi-monitor setups, survives network blips |
+| 4. System Tray + GUI | System tray icon + egui settings window | Non-intrusive status icon, device list, configuration |
 
 ## Sub-project 1: Fix Data Path
 
@@ -518,6 +519,126 @@ Sub-project 3 (Harden & Scale)
   ├── 3.4 Connection management
   ├── 3.5 Error handling
   └── 3.6 Fix def_window_proc
+       │
+       ▼
+Sub-project 4 (System Tray + GUI)
+  ├── 4.1 System tray icon
+  ├── 4.2 egui settings window
+  └── 4.3 Integration
 ```
 
-Each sub-project gets its own implementation plan. Sub-project 1 is the foundation — Sub-projects 2 and 3 depend on it.
+Each sub-project gets its own implementation plan. Sub-project 1 is the foundation — Sub-projects 2, 3, and 4 depend on it.
+
+---
+
+## Sub-project 4: System Tray + GUI
+
+### Problem
+
+OmniBridge is currently CLI-only. No visual indicator of connection status, no way to see discovered devices, no settings UI. Users must use terminal commands to interact with the app.
+
+### Design
+
+#### 4.1 System Tray
+
+Use `tray-icon` crate for a persistent system tray icon.
+
+**Tray icon states:**
+- **Disconnected** (gray icon): No server found
+- **Connected** (green icon): Connected to a peer
+- **Error** (red icon): Connection lost or error
+
+**Right-click menu:**
+- Show/Hide settings window
+- Connected devices (list with icons)
+- Status (role, address, uptime)
+- Start/Stop (toggle primary/secondary mode)
+- Quit
+
+**Implementation:**
+- Spawn tray icon on a dedicated thread (tray-icon requires a message loop)
+- Use `crossbeam-channel` for tray ↔ app communication
+- On menu click: send event to main app thread
+
+**New crate dependency:**
+```toml
+tray-icon = "0.19"
+```
+
+#### 4.2 egui Settings Window
+
+Use `eframe` (egui framework) for a small settings/status window.
+
+**Window contents:**
+- Device name (editable)
+- Role indicator (Primary/Secondary)
+- Connected devices list with status
+- Port configuration
+- Layout configuration (screen positions)
+- Connection health (latency, packet loss)
+- Log viewer (scrollable, filtered)
+
+**Window behavior:**
+- Hidden by default (closed to tray)
+- Show via tray menu or double-click tray icon
+- Non-blocking — runs in a separate thread
+- Scales to content, no fixed size
+
+**Implementation:**
+- `eframe::run_native()` in a dedicated thread
+- Shared state via `Arc<RwLock<AppState>>` between tray, app, and GUI
+- egui renders at 30fps (configurable)
+
+**New crate dependency:**
+```toml
+eframe = "0.29"
+```
+
+#### 4.3 Integration
+
+**Shared state structure:**
+```rust
+pub struct AppState {
+    pub device_name: String,
+    pub role: DeviceRole,
+    pub status: AppStatus,
+    pub connected_devices: Vec<DeviceInfo>,
+    pub config: OmniBridgeConfig,
+    pub logs: VecDeque<LogEntry>,
+}
+```
+
+**Thread architecture:**
+```
+Main thread (tokio runtime)
+  ├── Server/Client async tasks
+  ├── Tray icon thread (crossbeam-channel)
+  └── egui thread (Arc<RwLock<AppState>>)
+```
+
+**Lifecycle:**
+1. App starts → creates tray icon + shared state
+2. User clicks "Start" in tray menu → launches server/client on tokio runtime
+3. Status updates flow from async tasks → shared state → tray icon + egui
+4. User clicks "Quit" in tray menu → signals shutdown, waits for cleanup
+
+**Changes to `src/main.rs`:**
+- If `--gui` flag (or no flags): launch tray + egui instead of CLI mode
+- CLI mode still works for headless/automation use
+- Add `omnibridge gui` command to explicitly start GUI mode
+
+**Changes to `Cargo.toml`:**
+- Add `tray-icon` and `eframe` dependencies
+- Make them optional features (default = ["gui"])
+
+### Files changed
+
+| File | Change |
+|------|--------|
+| `Cargo.toml` | Add tray-icon, eframe deps; add "gui" feature |
+| `ob-gui/src/lib.rs` | Rewrite with tray + egui integration |
+| `ob-gui/src/app.rs` | Rewrite with shared AppState |
+| `ob-gui/src/tray.rs` | New: system tray management |
+| `ob-gui/src/settings.rs` | New: egui settings window |
+| `ob-gui/src/state.rs` | New: shared AppState |
+| `src/main.rs` | Add --gui flag, gui mode dispatch |
