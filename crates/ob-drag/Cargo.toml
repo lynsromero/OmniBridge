@@ -1,0 +1,16 @@
+[package]
+name = "ob-drag"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ob-core = { path = "../ob-core" }
+ob-capture = { path = "../ob-capture" }
+ob-codec = { path = "../ob-codec" }
+ob-display = { path = "../ob-display" }
+ob-layout = { path = "../ob-layout" }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+bytes = { workspace = true }

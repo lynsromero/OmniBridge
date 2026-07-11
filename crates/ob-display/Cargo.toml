@@ -1,0 +1,14 @@
+[package]
+name = "ob-display"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ob-core = { path = "../ob-core" }
+ob-codec = { path = "../ob-codec" }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+bytes = { workspace = true }
+uuid = { workspace = true }

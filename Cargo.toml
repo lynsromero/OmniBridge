@@ -1,0 +1,70 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/ob-core",
+    "crates/ob-network",
+    "crates/ob-input",
+    "crates/ob-capture",
+    "crates/ob-codec",
+    "crates/ob-display",
+    "crates/ob-layout",
+    "crates/ob-discovery",
+    "crates/ob-drag",
+    "crates/ob-cli",
+    "crates/ob-gui",
+    ".",
+]
+
+[package]
+name = "omnibridge"
+version = "0.1.0"
+edition = "2021"
+description = "Advanced cross-device KVM with seamless window dragging"
+license = "MIT"
+repository = "https://github.com/lynsromero/OmniBridge.git"
+
+[[bin]]
+name = "omnibridge"
+path = "src/main.rs"
+
+[dependencies]
+ob-core = { path = "crates/ob-core" }
+ob-network = { path = "crates/ob-network" }
+ob-input = { path = "crates/ob-input" }
+ob-capture = { path = "crates/ob-capture" }
+ob-codec = { path = "crates/ob-codec" }
+ob-display = { path = "crates/ob-display" }
+ob-layout = { path = "crates/ob-layout" }
+ob-discovery = { path = "crates/ob-discovery" }
+ob-drag = { path = "crates/ob-drag" }
+ob-cli = { path = "crates/ob-cli" }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+hostname = "0.4"
+dirs = "6"
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["full"] }
+anyhow = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4", "serde"] }
+bytes = "1"
+dashmap = "6"
+parking_lot = "0.12"
+zerocopy = { version = "0.8", features = ["derive"] }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
