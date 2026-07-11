@@ -1,4 +1,6 @@
 use anyhow::Result;
+use ob_capture::ScreenCapturer;
+use ob_codec::encoder::VideoEncoder;
 use ob_core::device::DeviceInfo;
 use ob_core::protocol::{Message, MessageType};
 use ob_input::InputCapture;
@@ -16,7 +18,8 @@ pub async fn run_server(
     info!("Running as server: {}", device.name);
     println!("Server started. Waiting for connections...");
 
-    let connected_clients: Arc<RwLock<Vec<(DeviceInfo, SocketAddr)>>> = Arc::new(RwLock::new(Vec::new()));
+    let connected_clients: Arc<RwLock<Vec<(DeviceInfo, SocketAddr)>>> =
+        Arc::new(RwLock::new(Vec::new()));
 
     let (input_tx, mut input_rx) = mpsc::channel::<ob_core::event::InputEvent>(256);
 
@@ -25,7 +28,7 @@ pub async fn run_server(
     #[cfg(target_os = "windows")]
     {
         input_capture.start().await?;
-        println!("Input capture active - move mouse to screen edges to switch devices");
+        println!("Input capture active");
     }
 
     let clients_for_forward = connected_clients.clone();
@@ -45,10 +48,94 @@ pub async fn run_server(
         }
     });
 
+    let clients_for_video = connected_clients.clone();
+    let udp_for_video = udp.clone();
+    let device_id = device.id;
+    tokio::spawn(async move {
+        let screens = match ob_capture::screen::ScreenCapturer::detect_screen_info() {
+            Ok(s) => s,
+            Err(e) => {
+                warn!("Failed to detect screens: {}", e);
+                return;
+            }
+        };
+        let screen = match screens.into_iter().next() {
+            Some(s) => s,
+            None => {
+                warn!("No screens detected");
+                return;
+            }
+        };
+
+        let mut capturer = ScreenCapturer::new(screen.clone());
+        if let Err(e) = capturer.start() {
+            warn!("Failed to start screen capture: {}", e);
+            return;
+        }
+
+        let mut encoder = VideoEncoder::new(screen.width, screen.height, 30);
+        let mut frame_seq: u64 = 0;
+
+        info!("Video streaming started: {}x{}", screen.width, screen.height);
+
+        loop {
+            tokio::time::sleep(std::time::Duration::from_millis(33)).await;
+
+            let clients = clients_for_video.read().await;
+            if clients.is_empty() {
+                continue;
+            }
+
+            match capturer.capture_frame() {
+                Ok(Some(frame)) => {
+                    match encoder.encode_frame(&frame) {
+                        Ok(encoded) => {
+                            frame_seq += 1;
+
+                            let frame_data = VideoFramePayload {
+                                source_device: device_id,
+                                width: encoded.width,
+                                height: encoded.height,
+                                timestamp_us: encoded.timestamp_us,
+                                is_keyframe: encoded.is_keyframe,
+                                pixels: encoded.data,
+                            };
+
+                            let payload = match serde_json::to_vec(&frame_data) {
+                                Ok(p) => p,
+                                Err(e) => {
+                                    warn!("Failed to serialize frame: {}", e);
+                                    continue;
+                                }
+                            };
+
+                            let msg = Message::new(MessageType::WindowFrame, payload)
+                                .with_sequence(frame_seq);
+
+                            for (_, addr) in clients.iter() {
+                                if let Err(e) = udp_for_video.send_to(&msg, *addr).await {
+                                    warn!("Failed to send frame to {}: {}", addr, e);
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            warn!("Encode failed: {}", e);
+                        }
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    warn!("Capture failed: {}", e);
+                }
+            }
+        }
+    });
+
     loop {
         tokio::select! {
             Some((new_device, addr)) = discovery_rx.recv() => {
-                let already_connected = connected_clients.read().await.iter().any(|(d, _)| d.id == new_device.id);
+                let already_connected = connected_clients
+                    .read().await.iter().any(|(d, _)| d.id == new_device.id);
                 if !already_connected {
                     println!("Device connected: {} ({})", new_device.name, addr);
 
@@ -59,10 +146,8 @@ pub async fn run_server(
                     udp.send_to(&handshake_ack, addr).await?;
 
                     connected_clients.write().await.push((new_device, addr));
+                    println!("{} clients connected", connected_clients.read().await.len());
                 }
-            }
-            _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {
-                // Periodic tasks
             }
             _ = tokio::signal::ctrl_c() => {
                 println!("\nShutting down server...");
@@ -72,4 +157,14 @@ pub async fn run_server(
     }
 
     Ok(())
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct VideoFramePayload {
+    source_device: ob_core::device::DeviceId,
+    width: u32,
+    height: u32,
+    timestamp_us: u64,
+    is_keyframe: bool,
+    pixels: Vec<u8>,
 }

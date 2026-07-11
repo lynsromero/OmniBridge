@@ -176,4 +176,60 @@ impl ScreenCapturer {
     pub fn frame_count(&self) -> u64 {
         self.frame_count
     }
+
+    pub fn detect_screen_info() -> Result<Vec<ob_core::screen::ScreenInfo>> {
+        #[cfg(target_os = "windows")]
+        {
+            Self::detect_windows_screens()
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            Ok(vec![ob_core::screen::ScreenInfo {
+                id: ob_core::screen::ScreenId(0),
+                name: "Display 1".to_string(),
+                width: 1920,
+                height: 1080,
+                x: 0,
+                y: 0,
+                scale_factor: 1.0,
+                is_primary: true,
+            }])
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    fn detect_windows_screens() -> Result<Vec<ob_core::screen::ScreenInfo>> {
+        #[link(name = "user32")]
+        extern "system" {
+            fn GetSystemMetrics(nIndex: i32) -> i32;
+        }
+
+        const SM_CMONITORS: i32 = 80;
+        const SM_XVIRTUALSCREEN: i32 = 76;
+        const SM_YVIRTUALSCREEN: i32 = 77;
+        const SM_CXVIRTUALSCREEN: i32 = 78;
+        const SM_CYVIRTUALSCREEN: i32 = 79;
+
+        let num_monitors = unsafe { GetSystemMetrics(SM_CMONITORS) };
+        let vx = unsafe { GetSystemMetrics(SM_XVIRTUALSCREEN) };
+        let vy = unsafe { GetSystemMetrics(SM_YVIRTUALSCREEN) };
+        let vw = unsafe { GetSystemMetrics(SM_CXVIRTUALSCREEN) };
+        let vh = unsafe { GetSystemMetrics(SM_CYVIRTUALSCREEN) };
+
+        let mut screens = Vec::new();
+        for i in 0..num_monitors.max(1) {
+            screens.push(ob_core::screen::ScreenInfo {
+                id: ob_core::screen::ScreenId(i as u32),
+                name: format!("Display {}", i + 1),
+                width: (vw / num_monitors.max(1)) as u32,
+                height: vh as u32,
+                x: vx + (i * vw / num_monitors.max(1)),
+                y: vy,
+                scale_factor: 1.0,
+                is_primary: i == 0,
+            });
+        }
+
+        Ok(screens)
+    }
 }
