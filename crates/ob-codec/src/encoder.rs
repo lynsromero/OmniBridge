@@ -66,21 +66,14 @@ impl VideoEncoder {
     }
 
     fn encode_software_h264(&self, frame: &CapturedFrame) -> Result<Vec<u8>> {
-        let mut output = Vec::with_capacity(frame.pixels.len() / 4);
+        let mut output = Vec::with_capacity(20 + frame.pixels.len());
 
-        output.extend_from_slice(&self.width.to_le_bytes());
-        output.extend_from_slice(&self.height.to_le_bytes());
-        output.extend_from_slice(&(frame.metadata.timestamp_us).to_le_bytes());
+        output.extend_from_slice(&frame.metadata.width.to_le_bytes());
+        output.extend_from_slice(&frame.metadata.height.to_le_bytes());
+        output.extend_from_slice(&frame.metadata.timestamp_us.to_le_bytes());
+        output.extend_from_slice(&(frame.pixels.len() as u32).to_le_bytes());
 
-        let quality = (self.bitrate as f64 / (self.width as f64 * self.height as f64 * 3.0)) as u8;
-        output.push(quality.min(51));
-
-        let skip = ((self.width as usize * self.height as usize) / output.len().max(1)).max(1);
-        let mut i = 0;
-        while i < frame.pixels.len() && output.len() < 65536 {
-            output.push(frame.pixels[i]);
-            i += skip * 4;
-        }
+        output.extend_from_slice(&frame.pixels);
 
         Ok(output)
     }
