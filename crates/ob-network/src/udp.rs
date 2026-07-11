@@ -43,6 +43,10 @@ impl UdpTransport {
         Ok(self.socket.local_addr()?)
     }
 
+    pub fn socket(&self) -> &UdpSocket {
+        &*self.socket
+    }
+
     pub async fn send_to(&self, msg: &Message, addr: SocketAddr) -> Result<()> {
         let data = msg.serialize()?;
         let mut buf = BytesMut::with_capacity(4 + data.len());

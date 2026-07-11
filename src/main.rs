@@ -84,12 +84,14 @@ async fn start_node(name: &str, port: u16, is_primary: bool) -> Result<()> {
     let udp_transport = ob_network::udp::UdpTransport::bind(udp_addr).await?;
     let udp_transport = std::sync::Arc::new(udp_transport);
 
-    let udp_clone = udp_transport.clone();
-    tokio::spawn(async move {
-        if let Err(e) = udp_clone.run_receive_loop().await {
-            tracing::error!("UDP receive loop error: {}", e);
-        }
-    });
+    if is_primary {
+        let udp_clone = udp_transport.clone();
+        tokio::spawn(async move {
+            if let Err(e) = udp_clone.run_receive_loop().await {
+                tracing::error!("UDP receive loop error: {}", e);
+            }
+        });
+    }
 
     if is_primary {
         server::run_server(local_device, listener_rx, udp_transport).await?;

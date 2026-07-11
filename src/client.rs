@@ -10,6 +10,16 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
+#[derive(serde::Serialize, serde::Deserialize)]
+struct VideoFramePayload {
+    source_device: ob_core::device::DeviceId,
+    width: u32,
+    height: u32,
+    timestamp_us: u64,
+    is_keyframe: bool,
+    pixels: Vec<u8>,
+}
+
 pub async fn run_client(
     device: DeviceInfo,
     mut discovery_rx: mpsc::Receiver<(DeviceInfo, SocketAddr)>,
@@ -19,24 +29,54 @@ pub async fn run_client(
     println!("Client started. Waiting for server...");
 
     let injector = InputInjector::new(device.id);
+
+    let (overlay_tx, mut overlay_rx) = mpsc::channel::<ob_codec::decoder::DecodedFrame>(32);
+
     let mut decoder = VideoDecoder::new();
     let mut overlay: Option<OverlayWindow> = None;
 
-    let (_msg_tx, mut msg_rx) = mpsc::channel::<(SocketAddr, Message)>(256);
-
+    let udp_for_frames = udp.clone();
     tokio::spawn(async move {
-        while let Some((_addr, msg)) = msg_rx.recv().await {
-            match msg.msg_type {
-                MessageType::InputEvent => {
-                    if let Ok(event) =
-                        serde_json::from_slice::<ob_core::event::InputEvent>(&msg.payload)
-                    {
-                        if let Err(e) = injector.inject(&event) {
-                            warn!("Failed to inject input: {}", e);
+        let mut frame_buf = vec![0u8; 65536 * 4];
+        loop {
+            match udp_for_frames.socket().recv_from(&mut frame_buf).await {
+                Ok((len, _addr)) => {
+                    if len < 4 {
+                        continue;
+                    }
+                    let packet_len = u32::from_le_bytes(frame_buf[0..4].try_into().unwrap_or([0;4])) as usize;
+                    if len < 4 + packet_len || packet_len > frame_buf.len() {
+                        continue;
+                    }
+                    match Message::deserialize(&frame_buf[4..4 + packet_len]) {
+                        Ok(msg) if msg.msg_type == MessageType::WindowFrame => {
+                            if let Ok(frame_data) = serde_json::from_slice::<VideoFramePayload>(&msg.payload) {
+                                let encoded = ob_codec::encoder::EncodedFrame {
+                                    data: frame_data.pixels,
+                                    width: frame_data.width,
+                                    height: frame_data.height,
+                                    frame_number: msg.sequence,
+                                    is_keyframe: frame_data.is_keyframe,
+                                    timestamp_us: frame_data.timestamp_us,
+                                    encode_time_us: 0,
+                                    format: ob_codec::encoder::EncodedFormat::H264,
+                                };
+                                match decoder.decode_frame(&encoded) {
+                                    Ok(decoded) => {
+                                        let _ = overlay_tx.send(decoded).await;
+                                    }
+                                    Err(e) => {
+                                        warn!("Decode failed: {}", e);
+                                    }
+                                }
+                            }
                         }
+                        _ => {}
                     }
                 }
-                _ => {}
+                Err(e) => {
+                    warn!("UDP recv error: {}", e);
+                }
             }
         }
     });
@@ -57,15 +97,22 @@ pub async fn run_client(
                     println!("Connected to server: {}", new_device.name);
                 }
             }
-            _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {
-                let clients = udp.peer_count().await;
-                if clients > 0 && overlay.is_none() {
+            Some(decoded_frame) = overlay_rx.recv() => {
+                if overlay.is_none() {
                     overlay = Some(OverlayWindow::new(
                         &format!("OmniBridge - {}", device.name),
-                        1920, 1080,
+                        decoded_frame.width, decoded_frame.height,
                     ));
                     println!("Overlay window created - receiving video");
                 }
+                if let Some(ref ov) = overlay {
+                    if let Err(e) = ov.render_frame(&decoded_frame) {
+                        warn!("Render failed: {}", e);
+                    }
+                }
+            }
+            _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {
+                // Periodic tasks
             }
             _ = tokio::signal::ctrl_c() => {
                 println!("\nShutting down client...");
