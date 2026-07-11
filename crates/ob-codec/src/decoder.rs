@@ -40,33 +40,20 @@ impl VideoDecoder {
     }
 
     fn decode_h264(&self, encoded: &EncodedFrame) -> Result<Vec<u8>> {
-        if encoded.data.len() < 13 {
+        if encoded.data.len() < 20 {
             return Err(anyhow::anyhow!("Encoded frame too small"));
         }
 
-        let width = u32::from_le_bytes(encoded.data[0..4].try_into()?);
-        let height = u32::from_le_bytes(encoded.data[4..8].try_into()?);
+        let _width = u32::from_le_bytes(encoded.data[0..4].try_into()?);
+        let _height = u32::from_le_bytes(encoded.data[4..8].try_into()?);
         let _timestamp = u64::from_le_bytes(encoded.data[8..16].try_into()?);
+        let pixel_data_len = u32::from_le_bytes(encoded.data[16..20].try_into()?) as usize;
 
-        let pixel_count = (width * height) as usize;
-        let mut pixels = vec![0u8; pixel_count * 4];
-
-        let _quality = *encoded.data.get(16).unwrap_or(&3);
-        let skip = ((width as usize * height as usize) / (encoded.data.len() - 17).max(1)).max(1);
-
-        let mut i = 0;
-        let mut pi = 0;
-        while i < encoded.data.len() - 17 && pi < pixel_count * 4 {
-            let val = encoded.data[17 + i];
-            pixels[pi] = val;
-            pixels[pi + 1] = val;
-            pixels[pi + 2] = val;
-            pixels[pi + 3] = 255;
-            pi += 4 * skip;
-            i += 1;
+        if encoded.data.len() < 20 + pixel_data_len {
+            return Err(anyhow::anyhow!("Pixel data truncated"));
         }
 
-        Ok(pixels)
+        Ok(encoded.data[20..20 + pixel_data_len].to_vec())
     }
 
     pub fn frame_count(&self) -> u64 {
