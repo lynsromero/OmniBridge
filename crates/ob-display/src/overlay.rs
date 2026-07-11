@@ -46,11 +46,13 @@ impl OverlayWindow {
                 hWndParent: *mut c_void, hMenu: *mut c_void,
                 hInstance: *mut c_void, lpParam: *mut c_void,
             ) -> *mut c_void;
+            fn ShowWindow(hWnd: *mut c_void, nCmdShow: i32) -> i32;
             fn GetDC(hWnd: *mut c_void) -> *mut c_void;
             fn GetModuleHandleA(lpModuleName: *const u8) -> *mut c_void;
         }
 
         #[repr(C)]
+        #[allow(non_snake_case)]
         struct WNDCLASSEXA {
             cbSize: u32,
             style: u32,
@@ -101,6 +103,8 @@ impl OverlayWindow {
                 std::ptr::null_mut(),
             );
 
+            ShowWindow(hwnd, 5); // SW_SHOW = 5
+
             let hdc = GetDC(hwnd);
 
             let bmi = BITMAPINFO {
@@ -145,15 +149,6 @@ impl OverlayWindow {
                 xSrc: i32, ySrc: i32, wSrc: i32, hSrc: i32,
                 lpBits: *const u8, lpbmi: *const BITMAPINFO,
                 iUsage: u32, dwRop: u32,
-            ) -> i32;
-        }
-
-        #[link(name = "user32")]
-        extern "system" {
-            fn SetWindowPos(
-                hWnd: *mut std::ffi::c_void,
-                hWndInsertAfter: *mut std::ffi::c_void,
-                x: i32, y: i32, cx: i32, cy: i32, uFlags: u32,
             ) -> i32;
         }
 
