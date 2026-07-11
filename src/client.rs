@@ -28,15 +28,15 @@ pub async fn run_client(
     info!("Running as client: {}", device.name);
     println!("Client started. Waiting for server...");
 
-    let injector = InputInjector::new(device.id);
-
     let (overlay_tx, mut overlay_rx) = mpsc::channel::<ob_codec::decoder::DecodedFrame>(32);
 
     let mut decoder = VideoDecoder::new();
     let mut overlay: Option<OverlayWindow> = None;
 
     let udp_for_frames = udp.clone();
+    let injector_device_id = device.id;
     tokio::spawn(async move {
+        let injector = InputInjector::new(injector_device_id);
         let mut frame_buf = vec![0u8; 65536 * 4];
         loop {
             match udp_for_frames.socket().recv_from(&mut frame_buf).await {
@@ -49,26 +49,38 @@ pub async fn run_client(
                         continue;
                     }
                     match Message::deserialize(&frame_buf[4..4 + packet_len]) {
-                        Ok(msg) if msg.msg_type == MessageType::WindowFrame => {
-                            if let Ok(frame_data) = serde_json::from_slice::<VideoFramePayload>(&msg.payload) {
-                                let encoded = ob_codec::encoder::EncodedFrame {
-                                    data: frame_data.pixels,
-                                    width: frame_data.width,
-                                    height: frame_data.height,
-                                    frame_number: msg.sequence,
-                                    is_keyframe: frame_data.is_keyframe,
-                                    timestamp_us: frame_data.timestamp_us,
-                                    encode_time_us: 0,
-                                    format: ob_codec::encoder::EncodedFormat::H264,
-                                };
-                                match decoder.decode_frame(&encoded) {
-                                    Ok(decoded) => {
-                                        let _ = overlay_tx.send(decoded).await;
-                                    }
-                                    Err(e) => {
-                                        warn!("Decode failed: {}", e);
+                        Ok(msg) => {
+                            match msg.msg_type {
+                                MessageType::WindowFrame => {
+                                    if let Ok(frame_data) = serde_json::from_slice::<VideoFramePayload>(&msg.payload) {
+                                        let encoded = ob_codec::encoder::EncodedFrame {
+                                            data: frame_data.pixels,
+                                            width: frame_data.width,
+                                            height: frame_data.height,
+                                            frame_number: msg.sequence,
+                                            is_keyframe: frame_data.is_keyframe,
+                                            timestamp_us: frame_data.timestamp_us,
+                                            encode_time_us: 0,
+                                            format: ob_codec::encoder::EncodedFormat::H264,
+                                        };
+                                        match decoder.decode_frame(&encoded) {
+                                            Ok(decoded) => {
+                                                let _ = overlay_tx.send(decoded).await;
+                                            }
+                                            Err(e) => {
+                                                warn!("Decode failed: {}", e);
+                                            }
+                                        }
                                     }
                                 }
+                                MessageType::InputEvent => {
+                                    if let Ok(event) = serde_json::from_slice::<ob_core::event::InputEvent>(&msg.payload) {
+                                        if let Err(e) = injector.inject(&event) {
+                                            warn!("Failed to inject input: {}", e);
+                                        }
+                                    }
+                                }
+                                _ => {}
                             }
                         }
                         _ => {}
