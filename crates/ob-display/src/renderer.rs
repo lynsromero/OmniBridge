@@ -3,8 +3,7 @@ use ob_codec::decoder::VideoDecoder;
 use tracing::debug;
 
 pub struct FrameRenderer {
-    #[allow(dead_code)]
-    decoder: VideoDecoder,
+    decoder: Option<VideoDecoder>,
     frame_count: u64,
     last_render_time: std::time::Instant,
 }
@@ -12,14 +11,18 @@ pub struct FrameRenderer {
 impl FrameRenderer {
     pub fn new() -> Self {
         Self {
-            decoder: VideoDecoder::new(),
+            decoder: None,
             frame_count: 0,
             last_render_time: std::time::Instant::now(),
         }
     }
 
-    pub fn render(&mut self, _encoded_data: &[u8], _width: u32, _height: u32) -> Result<()> {
+    pub fn render(&mut self, encoded_data: &[u8], width: u32, height: u32) -> Result<()> {
         self.frame_count += 1;
+
+        if self.decoder.is_none() {
+            self.decoder = Some(VideoDecoder::new(width, height));
+        }
 
         let now = std::time::Instant::now();
         let fps = 1000.0 / self.last_render_time.elapsed().as_millis().max(1) as f64;
@@ -28,6 +31,8 @@ impl FrameRenderer {
         if self.frame_count % 60 == 0 {
             debug!("Renderer: frame={}, fps={:.1}", self.frame_count, fps);
         }
+
+        let _ = encoded_data;
 
         Ok(())
     }

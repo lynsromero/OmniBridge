@@ -74,3 +74,67 @@ impl Message {
         Ok(Self { msg_type, payload, timestamp, sequence })
     }
 }
+
+pub type DeviceId = u64;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FrameFormat {
+    H264,
+    Raw,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WindowFrameHeader {
+    pub source_device: DeviceId,
+    pub width: u32,
+    pub height: u32,
+    pub timestamp_us: u64,
+    pub is_keyframe: bool,
+    pub format: FrameFormat,
+}
+
+impl WindowFrameHeader {
+    pub const HEADER_SIZE: usize = 8 + 4 + 4 + 8 + 1 + 4;
+
+    pub fn encode(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(Self::HEADER_SIZE);
+        buf.extend_from_slice(&self.source_device.to_le_bytes());
+        buf.extend_from_slice(&self.width.to_le_bytes());
+        buf.extend_from_slice(&self.height.to_le_bytes());
+        buf.extend_from_slice(&self.timestamp_us.to_le_bytes());
+        buf.push(self.is_keyframe as u8);
+        buf.extend_from_slice(&(self.format as u32).to_le_bytes());
+        buf
+    }
+
+    pub fn decode(data: &[u8]) -> anyhow::Result<Self> {
+        if data.len() < Self::HEADER_SIZE {
+            anyhow::bail!("WindowFrameHeader too short: {} < {}", data.len(), Self::HEADER_SIZE);
+        }
+        let source_device = u64::from_le_bytes(data[0..8].try_into()?);
+        let width = u32::from_le_bytes(data[8..12].try_into()?);
+        let height = u32::from_le_bytes(data[12..16].try_into()?);
+        let timestamp_us = u64::from_le_bytes(data[16..24].try_into()?);
+        let is_keyframe = data[24] != 0;
+        let format = match u32::from_le_bytes(data[25..29].try_into()?) {
+            0 => FrameFormat::H264,
+            1 => FrameFormat::Raw,
+            _ => anyhow::bail!("Unknown frame format"),
+        };
+        Ok(Self { source_device, width, height, timestamp_us, is_keyframe, format })
+    }
+
+    pub fn frame_data<'a>(&self, payload: &'a [u8]) -> &'a [u8] {
+        &payload[Self::HEADER_SIZE..]
+    }
+
+    pub fn from_message(msg: &Message) -> anyhow::Result<Self> {
+        Self::decode(&msg.payload)
+    }
+
+    pub fn to_payload(&self, frame_data: &[u8]) -> Vec<u8> {
+        let mut payload = self.encode();
+        payload.extend_from_slice(frame_data);
+        payload
+    }
+}

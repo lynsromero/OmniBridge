@@ -30,7 +30,7 @@ pub async fn run_client(
 
     let (overlay_tx, mut overlay_rx) = mpsc::channel::<ob_codec::decoder::DecodedFrame>(32);
 
-    let mut decoder = VideoDecoder::new();
+    let mut decoder: Option<VideoDecoder> = None;
     let mut overlay: Option<OverlayWindow> = None;
 
     let udp_for_frames = udp.clone();
@@ -53,22 +53,32 @@ pub async fn run_client(
                             match msg.msg_type {
                                 MessageType::WindowFrame => {
                                     if let Ok(frame_data) = serde_json::from_slice::<VideoFramePayload>(&msg.payload) {
-                                        let encoded = ob_codec::encoder::EncodedFrame {
-                                            data: frame_data.pixels,
-                                            width: frame_data.width,
-                                            height: frame_data.height,
-                                            frame_number: msg.sequence,
-                                            is_keyframe: frame_data.is_keyframe,
-                                            timestamp_us: frame_data.timestamp_us,
-                                            encode_time_us: 0,
-                                            format: ob_codec::encoder::EncodedFormat::H264,
-                                        };
-                                        match decoder.decode_frame(&encoded) {
-                                            Ok(decoded) => {
-                                                let _ = overlay_tx.send(decoded).await;
-                                            }
-                                            Err(e) => {
-                                                warn!("Decode failed: {}", e);
+                                        let frame_num = msg.sequence;
+                                        let width = frame_data.width;
+                                        let height = frame_data.height;
+
+                                        if decoder.is_none() {
+                                            decoder = Some(VideoDecoder::new(width, height));
+                                        }
+
+                                        if let Some(ref mut dec) = decoder {
+                                            let encoded = ob_codec::encoder::EncodedFrame {
+                                                data: frame_data.pixels,
+                                                width: frame_data.width,
+                                                height: frame_data.height,
+                                                frame_number: frame_num,
+                                                is_keyframe: frame_data.is_keyframe,
+                                                timestamp_us: frame_data.timestamp_us,
+                                                encode_time_us: 0,
+                                                format: ob_codec::encoder::EncodedFormat::H264,
+                                            };
+                                            match dec.decode_frame(&encoded) {
+                                                Ok(decoded) => {
+                                                    let _ = overlay_tx.send(decoded).await;
+                                                }
+                                                Err(e) => {
+                                                    warn!("Decode failed: {}", e);
+                                                }
                                             }
                                         }
                                     }
