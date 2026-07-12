@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::UdpSocket;
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::{broadcast, mpsc, RwLock};
 use tracing::{debug, error, info, warn};
 
 pub struct UdpTransport {
@@ -14,6 +14,7 @@ pub struct UdpTransport {
     message_tx: mpsc::Sender<(SocketAddr, Message)>,
     #[allow(dead_code)]
     message_rx: Arc<RwLock<mpsc::Receiver<(SocketAddr, Message)>>>,
+    broadcast_tx: broadcast::Sender<(SocketAddr, Message)>,
     buffer_size: usize,
 }
 
@@ -29,12 +30,14 @@ impl UdpTransport {
         info!("UDP transport bound to {}", addr);
 
         let (tx, rx) = mpsc::channel(1024);
+        let (broadcast_tx, _) = broadcast::channel(256);
 
         Ok(Self {
             socket,
             peers: Arc::new(RwLock::new(HashMap::new())),
             message_tx: tx,
             message_rx: Arc::new(RwLock::new(rx)),
+            broadcast_tx,
             buffer_size: 65536,
         })
     }
@@ -45,6 +48,10 @@ impl UdpTransport {
 
     pub fn socket(&self) -> &UdpSocket {
         &*self.socket
+    }
+
+    pub fn subscribe(&self) -> broadcast::Receiver<(SocketAddr, Message)> {
+        self.broadcast_tx.subscribe()
     }
 
     pub async fn send_to(&self, msg: &Message, addr: SocketAddr) -> Result<()> {
@@ -96,6 +103,8 @@ impl UdpTransport {
                             last_seen: std::time::Instant::now(),
                         });
                     }
+
+                    let _ = self.broadcast_tx.send((addr, msg.clone()));
 
                     if let Err(e) = self.message_tx.send((addr, msg)).await {
                         error!("Failed to forward message: {}", e);
