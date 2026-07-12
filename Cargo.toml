@@ -62,7 +62,7 @@ bytes = "1"
 dashmap = "6"
 parking_lot = "0.12"
 zerocopy = { version = "0.8", features = ["derive"] }
-ffmpeg-next = "7.0"
+ffmpeg-next = "8.1"
 
 [profile.release]
 opt-level = 3

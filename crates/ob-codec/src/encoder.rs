@@ -1,30 +1,44 @@
 use anyhow::Result;
+use ffmpeg_next as ffmpeg;
 use ob_capture::frame::CapturedFrame;
 use tracing::{debug, info};
 
+#[allow(dead_code)]
 pub struct VideoEncoder {
     width: u32,
     height: u32,
     target_fps: u32,
     bitrate: u32,
     frame_count: u64,
-    encoder_type: EncoderType,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub enum EncoderType {
-    SoftwareH264,
-    NvencH264,
-    QsvH264,
-    AmfH264,
+    encoder: ffmpeg::codec::encoder::video::Encoder,
+    frame: ffmpeg::frame::Video,
 }
 
 impl VideoEncoder {
     pub fn new(width: u32, height: u32, target_fps: u32) -> Self {
-        let encoder_type = detect_best_encoder();
+        ffmpeg::init().expect("Failed to initialize ffmpeg");
+
+        let mut ctx = ffmpeg::encoder::new().video().expect("Failed to create video encoder context");
+
+        ctx.set_width(width);
+        ctx.set_height(height);
+        ctx.set_format(ffmpeg::format::Pixel::YUV420P);
+        ctx.set_time_base(ffmpeg::Rational::new(1, target_fps as i32));
+        ctx.set_max_b_frames(0);
+        ctx.set_bit_rate(width as usize * height as usize * 3 / 10);
+
+        let mut options = ffmpeg::Dictionary::new();
+        options.set("preset", "ultrafast");
+        options.set("tune", "zerolatency");
+        options.set("crf", "23");
+
+        let encoder = ctx.open_with(options).expect("Failed to open encoder");
+
+        let frame = ffmpeg::frame::Video::new(ffmpeg::format::Pixel::YUV420P, width, height);
+
         info!(
-            "Creating video encoder: {}x{} @ {}fps using {:?}",
-            width, height, target_fps, encoder_type
+            "Created ffmpeg H.264 encoder: {}x{} @ {}fps",
+            width, height, target_fps
         );
 
         Self {
@@ -33,7 +47,8 @@ impl VideoEncoder {
             target_fps,
             bitrate: width * height * 3 / 10,
             frame_count: 0,
-            encoder_type,
+            encoder,
+            frame,
         }
     }
 
@@ -46,10 +61,19 @@ impl VideoEncoder {
         self.frame_count += 1;
         let start = std::time::Instant::now();
 
-        let encoded_data = match self.encoder_type {
-            EncoderType::SoftwareH264 => self.encode_software_h264(frame)?,
-            _ => self.encode_software_h264(frame)?,
-        };
+        self.convert_bgra_to_yuv420p(&frame.pixels, frame.metadata.width, frame.metadata.height);
+        self.frame.set_pts(Some(self.frame_count as i64));
+
+        self.encoder.send_frame(&self.frame)?;
+
+        let mut encoded_data = Vec::new();
+        let mut packet = ffmpeg::packet::Packet::empty();
+        while self.encoder.receive_packet(&mut packet).is_ok() {
+            if let Some(data) = packet.data() {
+                encoded_data.extend_from_slice(data);
+            }
+            packet = ffmpeg::packet::Packet::empty();
+        }
 
         let encode_time = start.elapsed().as_micros() as u64;
 
@@ -65,17 +89,47 @@ impl VideoEncoder {
         })
     }
 
-    fn encode_software_h264(&self, frame: &CapturedFrame) -> Result<Vec<u8>> {
-        let mut output = Vec::with_capacity(20 + frame.pixels.len());
+    fn convert_bgra_to_yuv420p(&mut self, bgra: &[u8], width: u32, height: u32) {
+        let y_stride = self.frame.stride(0);
+        let u_stride = self.frame.stride(1);
+        let v_stride = self.frame.stride(2);
 
-        output.extend_from_slice(&frame.metadata.width.to_le_bytes());
-        output.extend_from_slice(&frame.metadata.height.to_le_bytes());
-        output.extend_from_slice(&frame.metadata.timestamp_us.to_le_bytes());
-        output.extend_from_slice(&(frame.pixels.len() as u32).to_le_bytes());
+        unsafe {
+            let frame_ptr = self.frame.as_mut_ptr();
+            let y_ptr = (*frame_ptr).data[0] as *mut u8;
+            let u_ptr = (*frame_ptr).data[1] as *mut u8;
+            let v_ptr = (*frame_ptr).data[2] as *mut u8;
 
-        output.extend_from_slice(&frame.pixels);
+            for y in 0..height {
+                for x in 0..width {
+                    let idx = ((y * width + x) * 4) as usize;
+                    let b = bgra[idx] as f32;
+                    let g = bgra[idx + 1] as f32;
+                    let r = bgra[idx + 2] as f32;
 
-        Ok(output)
+                    let y_val = (0.299 * r + 0.587 * g + 0.114 * b).clamp(0.0, 255.0) as u8;
+                    let y_pos = (y * y_stride as u32 + x) as usize;
+                    *y_ptr.add(y_pos) = y_val;
+
+                    if y % 2 == 0 && x % 2 == 0 {
+                        let u_val =
+                            (-0.169 * r - 0.331 * g + 0.500 * b + 128.0).clamp(0.0, 255.0)
+                                as u8;
+                        let v_val =
+                            (0.500 * r - 0.419 * g - 0.081 * b + 128.0).clamp(0.0, 255.0)
+                                as u8;
+                        let u_pos = ((y / 2) * u_stride as u32 + (x / 2)) as usize;
+                        let v_pos = ((y / 2) * v_stride as u32 + (x / 2)) as usize;
+                        *u_ptr.add(u_pos) = u_val;
+                        *v_ptr.add(v_pos) = v_val;
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn force_keyframe(&mut self) {
+        self.frame_count = 0;
     }
 
     pub fn frame_count(&self) -> u64 {
@@ -83,44 +137,7 @@ impl VideoEncoder {
     }
 }
 
-fn detect_best_encoder() -> EncoderType {
-    #[cfg(target_os = "windows")]
-    {
-        if check_nvenc_available() {
-            return EncoderType::NvencH264;
-        }
-        if check_qsv_available() {
-            return EncoderType::QsvH264;
-        }
-    }
-    EncoderType::SoftwareH264
-}
-
-#[cfg(target_os = "windows")]
-fn check_nvenc_available() -> bool {
-    let paths = [
-        "C:\\Windows\\System32\\nvEncodeAPI64.dll",
-        "C:\\Windows\\System32\\nvencapi.dll",
-    ];
-    paths.iter().any(|p| std::path::Path::new(p).exists())
-}
-
-#[cfg(target_os = "windows")]
-fn check_qsv_available() -> bool {
-    let paths = [
-        "C:\\Windows\\System32\\libmfxhw64.dll",
-        "C:\\Windows\\System32\\IntelQuickSyncVideo.dll",
-    ];
-    paths.iter().any(|p| std::path::Path::new(p).exists())
-}
-
-#[cfg(not(target_os = "windows"))]
-fn check_nvenc_available() -> bool { false }
-
-#[cfg(not(target_os = "windows"))]
-fn check_qsv_available() -> bool { false }
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct EncodedFrame {
     pub data: Vec<u8>,
     pub width: u32,
@@ -132,9 +149,7 @@ pub struct EncodedFrame {
     pub format: EncodedFormat,
 }
 
-use serde::{Deserialize, Serialize};
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum EncodedFormat {
     H264,
     H265,
