@@ -1,7 +1,7 @@
 use anyhow::Result;
 use ob_codec::decoder::VideoDecoder;
 use ob_core::device::DeviceInfo;
-use ob_core::protocol::{Message, MessageType};
+use ob_core::protocol::{FrameFormat, Message, MessageType, WindowFrameHeader};
 use ob_display::overlay::OverlayWindow;
 use ob_input::InputInjector;
 use ob_network::udp::UdpTransport;
@@ -9,16 +9,6 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
-
-#[derive(serde::Serialize, serde::Deserialize)]
-struct VideoFramePayload {
-    source_device: ob_core::device::DeviceId,
-    width: u32,
-    height: u32,
-    timestamp_us: u64,
-    is_keyframe: bool,
-    pixels: Vec<u8>,
-}
 
 pub async fn run_client(
     device: DeviceInfo,
@@ -33,71 +23,65 @@ pub async fn run_client(
     let mut decoder: Option<VideoDecoder> = None;
     let mut overlay: Option<OverlayWindow> = None;
 
-    let udp_for_frames = udp.clone();
+    let mut broadcast_rx = udp.subscribe();
     let injector_device_id = device.id;
     tokio::spawn(async move {
         let injector = InputInjector::new(injector_device_id);
-        let mut frame_buf = vec![0u8; 65536 * 4];
         loop {
-            match udp_for_frames.socket().recv_from(&mut frame_buf).await {
-                Ok((len, _addr)) => {
-                    if len < 4 {
-                        continue;
-                    }
-                    let packet_len = u32::from_le_bytes(frame_buf[0..4].try_into().unwrap_or([0;4])) as usize;
-                    if len < 4 + packet_len || packet_len > frame_buf.len() {
-                        continue;
-                    }
-                    match Message::deserialize(&frame_buf[4..4 + packet_len]) {
-                        Ok(msg) => {
-                            match msg.msg_type {
-                                MessageType::WindowFrame => {
-                                    if let Ok(frame_data) = serde_json::from_slice::<VideoFramePayload>(&msg.payload) {
-                                        let frame_num = msg.sequence;
-                                        let width = frame_data.width;
-                                        let height = frame_data.height;
+            match broadcast_rx.recv().await {
+                Ok((_addr, msg)) => {
+                    match msg.msg_type {
+                        MessageType::WindowFrame => {
+                            if let Ok(header) = WindowFrameHeader::decode(&msg.payload) {
+                                let frame_data = header.frame_data(&msg.payload);
 
-                                        if decoder.is_none() {
-                                            decoder = Some(VideoDecoder::new(width, height));
+                                if decoder.is_none() {
+                                    decoder = Some(VideoDecoder::new(header.width, header.height));
+                                }
+
+                                if let Some(ref mut dec) = decoder {
+                                    let encoded = ob_codec::encoder::EncodedFrame {
+                                        data: frame_data.to_vec(),
+                                        width: header.width,
+                                        height: header.height,
+                                        frame_number: msg.sequence,
+                                        is_keyframe: header.is_keyframe,
+                                        timestamp_us: header.timestamp_us,
+                                        encode_time_us: 0,
+                                        format: match header.format {
+                                            FrameFormat::H264 => ob_codec::encoder::EncodedFormat::H264,
+                                            _ => ob_codec::encoder::EncodedFormat::H264,
+                                        },
+                                    };
+                                    match dec.decode_frame(&encoded) {
+                                        Ok(decoded) => {
+                                            let _ = overlay_tx.send(decoded).await;
                                         }
-
-                                        if let Some(ref mut dec) = decoder {
-                                            let encoded = ob_codec::encoder::EncodedFrame {
-                                                data: frame_data.pixels,
-                                                width: frame_data.width,
-                                                height: frame_data.height,
-                                                frame_number: frame_num,
-                                                is_keyframe: frame_data.is_keyframe,
-                                                timestamp_us: frame_data.timestamp_us,
-                                                encode_time_us: 0,
-                                                format: ob_codec::encoder::EncodedFormat::H264,
-                                            };
-                                            match dec.decode_frame(&encoded) {
-                                                Ok(decoded) => {
-                                                    let _ = overlay_tx.send(decoded).await;
-                                                }
-                                                Err(e) => {
-                                                    warn!("Decode failed: {}", e);
-                                                }
-                                            }
+                                        Err(e) => {
+                                            warn!("Decode failed: {}", e);
                                         }
                                     }
                                 }
-                                MessageType::InputEvent => {
-                                    if let Ok(event) = serde_json::from_slice::<ob_core::event::InputEvent>(&msg.payload) {
-                                        if let Err(e) = injector.inject(&event) {
-                                            warn!("Failed to inject input: {}", e);
-                                        }
-                                    }
+                            }
+                        }
+                        MessageType::InputEvent => {
+                            if let Ok(event) =
+                                serde_json::from_slice::<ob_core::event::InputEvent>(&msg.payload)
+                            {
+                                if let Err(e) = injector.inject(&event) {
+                                    warn!("Failed to inject input: {}", e);
                                 }
-                                _ => {}
                             }
                         }
                         _ => {}
                     }
                 }
-                Err(e) => {
-                    warn!("UDP recv error: {}", e);
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                    warn!("Skipped {} messages (receiver lagged)", n);
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    warn!("Broadcast channel closed");
+                    break;
                 }
             }
         }
@@ -134,7 +118,6 @@ pub async fn run_client(
                 }
             }
             _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {
-                // Periodic tasks
             }
             _ = tokio::signal::ctrl_c() => {
                 println!("\nShutting down client...");

@@ -2,7 +2,7 @@ use anyhow::Result;
 use ob_capture::ScreenCapturer;
 use ob_codec::encoder::VideoEncoder;
 use ob_core::device::DeviceInfo;
-use ob_core::protocol::{Message, MessageType};
+use ob_core::protocol::{FrameFormat, Message, MessageType, WindowFrameHeader};
 use ob_input::InputCapture;
 use ob_network::udp::UdpTransport;
 use std::net::SocketAddr;
@@ -92,22 +92,16 @@ pub async fn run_server(
                         Ok(encoded) => {
                             frame_seq += 1;
 
-                            let frame_data = VideoFramePayload {
-                                source_device: device_id,
+                            let header = WindowFrameHeader {
+                                source_device: *device_id.0.as_bytes(),
                                 width: encoded.width,
                                 height: encoded.height,
                                 timestamp_us: encoded.timestamp_us,
                                 is_keyframe: encoded.is_keyframe,
-                                pixels: encoded.data,
+                                format: FrameFormat::H264,
                             };
 
-                            let payload = match serde_json::to_vec(&frame_data) {
-                                Ok(p) => p,
-                                Err(e) => {
-                                    warn!("Failed to serialize frame: {}", e);
-                                    continue;
-                                }
-                            };
+                            let payload = header.to_payload(&encoded.data);
 
                             let msg = Message::new(MessageType::WindowFrame, payload)
                                 .with_sequence(frame_seq);
@@ -157,14 +151,4 @@ pub async fn run_server(
     }
 
     Ok(())
-}
-
-#[derive(serde::Serialize, serde::Deserialize)]
-struct VideoFramePayload {
-    source_device: ob_core::device::DeviceId,
-    width: u32,
-    height: u32,
-    timestamp_us: u64,
-    is_keyframe: bool,
-    pixels: Vec<u8>,
 }

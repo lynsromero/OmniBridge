@@ -75,8 +75,6 @@ impl Message {
     }
 }
 
-pub type DeviceId = u64;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FrameFormat {
     H264,
@@ -85,7 +83,7 @@ pub enum FrameFormat {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WindowFrameHeader {
-    pub source_device: DeviceId,
+    pub source_device: [u8; 16],
     pub width: u32,
     pub height: u32,
     pub timestamp_us: u64,
@@ -94,11 +92,11 @@ pub struct WindowFrameHeader {
 }
 
 impl WindowFrameHeader {
-    pub const HEADER_SIZE: usize = 8 + 4 + 4 + 8 + 1 + 4;
+    pub const HEADER_SIZE: usize = 16 + 4 + 4 + 8 + 1 + 4;
 
     pub fn encode(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(Self::HEADER_SIZE);
-        buf.extend_from_slice(&self.source_device.to_le_bytes());
+        buf.extend_from_slice(&self.source_device);
         buf.extend_from_slice(&self.width.to_le_bytes());
         buf.extend_from_slice(&self.height.to_le_bytes());
         buf.extend_from_slice(&self.timestamp_us.to_le_bytes());
@@ -111,12 +109,13 @@ impl WindowFrameHeader {
         if data.len() < Self::HEADER_SIZE {
             anyhow::bail!("WindowFrameHeader too short: {} < {}", data.len(), Self::HEADER_SIZE);
         }
-        let source_device = u64::from_le_bytes(data[0..8].try_into()?);
-        let width = u32::from_le_bytes(data[8..12].try_into()?);
-        let height = u32::from_le_bytes(data[12..16].try_into()?);
-        let timestamp_us = u64::from_le_bytes(data[16..24].try_into()?);
-        let is_keyframe = data[24] != 0;
-        let format = match u32::from_le_bytes(data[25..29].try_into()?) {
+        let mut source_device = [0u8; 16];
+        source_device.copy_from_slice(&data[0..16]);
+        let width = u32::from_le_bytes(data[16..20].try_into()?);
+        let height = u32::from_le_bytes(data[20..24].try_into()?);
+        let timestamp_us = u64::from_le_bytes(data[24..32].try_into()?);
+        let is_keyframe = data[32] != 0;
+        let format = match u32::from_le_bytes(data[33..37].try_into()?) {
             0 => FrameFormat::H264,
             1 => FrameFormat::Raw,
             _ => anyhow::bail!("Unknown frame format"),
