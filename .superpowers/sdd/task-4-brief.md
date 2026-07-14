@@ -1,0 +1,264 @@
+### Task 4: Add Screen Capture + Frame Streaming to Server
+
+**Files:**
+- Modify: `src/server.rs` (add capture timer and frame streaming task)
+
+**Interfaces:**
+- Consumes: `ScreenCapturer` (from `ob-capture`), `VideoEncoder` (from `ob-codec`), `connected_clients` (Arc<RwLock>)
+- Produces: Sends `MessageType::WindowFrame` messages to all connected clients every ~33ms
+
+The server currently only forwards input events. Add a separate tokio task that captures the screen at 30fps, encodes each frame, and sends it to all connected clients via UDP.
+
+- [ ] **Step 1: Rewrite server.rs**
+
+Replace the entire contents of `src/server.rs` with:
+
+```rust
+use anyhow::Result;
+use ob_capture::ScreenCapturer;
+use ob_codec::encoder::VideoEncoder;
+use ob_core::device::DeviceInfo;
+use ob_core::protocol::{Message, MessageType};
+use ob_input::InputCapture;
+use ob_network::udp::UdpTransport;
+use std::net::SocketAddr;
+use std::sync::Arc;
+use tokio::sync::{mpsc, RwLock};
+use tracing::{info, warn};
+
+pub async fn run_server(
+    device: DeviceInfo,
+    mut discovery_rx: mpsc::Receiver<(DeviceInfo, SocketAddr)>,
+    udp: Arc<UdpTransport>,
+) -> Result<()> {
+    info!("Running as server: {}", device.name);
+    println!("Server started. Waiting for connections...");
+
+    let connected_clients: Arc<RwLock<Vec<(DeviceInfo, SocketAddr)>>> =
+        Arc::new(RwLock::new(Vec::new()));
+
+    let (input_tx, mut input_rx) = mpsc::channel::<ob_core::event::InputEvent>(256);
+
+    let mut input_capture = InputCapture::new(input_tx);
+
+    #[cfg(target_os = "windows")]
+    {
+        input_capture.start().await?;
+        println!("Input capture active");
+    }
+
+    let clients_for_forward = connected_clients.clone();
+    let udp_for_forward = udp.clone();
+    tokio::spawn(async move {
+        while let Some(event) = input_rx.recv().await {
+            let clients = clients_for_forward.read().await;
+            for (_, addr) in clients.iter() {
+                let msg = Message::new(
+                    MessageType::InputEvent,
+                    serde_json::to_vec(&event).unwrap_or_default(),
+                );
+                if let Err(e) = udp_for_forward.send_to(&msg, *addr).await {
+                    warn!("Failed to send input to {}: {}", addr, e);
+                }
+            }
+        }
+    });
+
+    let clients_for_video = connected_clients.clone();
+    let udp_for_video = udp.clone();
+    let device_id = device.id;
+    tokio::spawn(async move {
+        let screens = match ob_capture::screen::ScreenCapturer::detect_screen_info() {
+            Ok(s) => s,
+            Err(e) => {
+                warn!("Failed to detect screens: {}", e);
+                return;
+            }
+        };
+        let screen = match screens.into_iter().next() {
+            Some(s) => s,
+            None => {
+                warn!("No screens detected");
+                return;
+            }
+        };
+
+        let mut capturer = ScreenCapturer::new(screen.clone());
+        if let Err(e) = capturer.start() {
+            warn!("Failed to start screen capture: {}", e);
+            return;
+        }
+
+        let mut encoder = VideoEncoder::new(screen.width, screen.height, 30);
+        let mut frame_seq: u64 = 0;
+
+        info!("Video streaming started: {}x{}", screen.width, screen.height);
+
+        loop {
+            tokio::time::sleep(std::time::Duration::from_millis(33)).await;
+
+            let clients = clients_for_video.read().await;
+            if clients.is_empty() {
+                continue;
+            }
+
+            match capturer.capture_frame() {
+                Ok(Some(frame)) => {
+                    match encoder.encode_frame(&frame) {
+                        Ok(encoded) => {
+                            frame_seq += 1;
+
+                            let frame_data = VideoFramePayload {
+                                source_device: device_id,
+                                width: encoded.width,
+                                height: encoded.height,
+                                timestamp_us: encoded.timestamp_us,
+                                is_keyframe: encoded.is_keyframe,
+                                pixels: encoded.data,
+                            };
+
+                            let payload = match serde_json::to_vec(&frame_data) {
+                                Ok(p) => p,
+                                Err(e) => {
+                                    warn!("Failed to serialize frame: {}", e);
+                                    continue;
+                                }
+                            };
+
+                            let msg = Message::new(MessageType::WindowFrame, payload)
+                                .with_sequence(frame_seq);
+
+                            for (_, addr) in clients.iter() {
+                                if let Err(e) = udp_for_video.send_to(&msg, *addr).await {
+                                    warn!("Failed to send frame to {}: {}", addr, e);
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            warn!("Encode failed: {}", e);
+                        }
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    warn!("Capture failed: {}", e);
+                }
+            }
+        }
+    });
+
+    loop {
+        tokio::select! {
+            Some((new_device, addr)) = discovery_rx.recv() => {
+                let already_connected = connected_clients
+                    .read().await.iter().any(|(d, _)| d.id == new_device.id);
+                if !already_connected {
+                    println!("Device connected: {} ({})", new_device.name, addr);
+
+                    let handshake_ack = Message::new(
+                        MessageType::HandshakeAck,
+                        serde_json::to_vec(&device)?,
+                    );
+                    udp.send_to(&handshake_ack, addr).await?;
+
+                    connected_clients.write().await.push((new_device, addr));
+                    println!("{} clients connected", connected_clients.read().await.len());
+                }
+            }
+            _ = tokio::signal::ctrl_c() => {
+                println!("\nShutting down server...");
+                break;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct VideoFramePayload {
+    source_device: ob_core::device::DeviceId,
+    width: u32,
+    height: u32,
+    timestamp_us: u64,
+    is_keyframe: bool,
+    pixels: Vec<u8>,
+}
+```
+
+- [ ] **Step 2: Add `detect_screen_info` method to ScreenCapturer**
+
+The server calls `ScreenCapturer::detect_screen_info()` which doesn't exist yet. Add it to `crates/ob-capture/src/screen.rs` by appending before the closing `}` of the `impl ScreenCapturer` block:
+
+```rust
+    pub fn detect_screen_info() -> Result<Vec<ob_core::screen::ScreenInfo>> {
+        #[cfg(target_os = "windows")]
+        {
+            Self::detect_windows_screens()
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            Ok(vec![ob_core::screen::ScreenInfo {
+                id: ob_core::screen::ScreenId(0),
+                name: "Display 1".to_string(),
+                width: 1920,
+                height: 1080,
+                x: 0,
+                y: 0,
+                scale_factor: 1.0,
+                is_primary: true,
+            }])
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    fn detect_windows_screens() -> Result<Vec<ob_core::screen::ScreenInfo>> {
+        #[link(name = "user32")]
+        extern "system" {
+            fn GetSystemMetrics(nIndex: i32) -> i32;
+        }
+
+        const SM_CMONITORS: i32 = 80;
+        const SM_XVIRTUALSCREEN: i32 = 76;
+        const SM_YVIRTUALSCREEN: i32 = 77;
+        const SM_CXVIRTUALSCREEN: i32 = 78;
+        const SM_CYVIRTUALSCREEN: i32 = 79;
+
+        let num_monitors = unsafe { GetSystemMetrics(SM_CMONITORS) };
+        let vx = unsafe { GetSystemMetrics(SM_XVIRTUALSCREEN) };
+        let vy = unsafe { GetSystemMetrics(SM_YVIRTUALSCREEN) };
+        let vw = unsafe { GetSystemMetrics(SM_CXVIRTUALSCREEN) };
+        let vh = unsafe { GetSystemMetrics(SM_CYVIRTUALSCREEN) };
+
+        let mut screens = Vec::new();
+        for i in 0..num_monitors.max(1) {
+            screens.push(ob_core::screen::ScreenInfo {
+                id: ob_core::screen::ScreenId(i as u32),
+                name: format!("Display {}", i + 1),
+                width: (vw / num_monitors.max(1)) as u32,
+                height: vh as u32,
+                x: vx + (i * vw / num_monitors.max(1)),
+                y: vy,
+                scale_factor: 1.0,
+                is_primary: i == 0,
+            });
+        }
+
+        Ok(screens)
+    }
+```
+
+- [ ] **Step 3: Verify it compiles**
+
+Run: `cargo check`
+Expected: OK
+
+- [ ] **Step 4: Commit**
+
+```bash
+git add src/server.rs crates/ob-capture/src/screen.rs
+git commit -m "feat(server): add screen capture and frame streaming to clients"
+```
+
+---
+

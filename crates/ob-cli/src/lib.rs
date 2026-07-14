@@ -32,6 +32,8 @@ pub enum Commands {
 
     Status,
 
+    Gui,
+
     Layout {
         #[command(subcommand)]
         action: LayoutAction,

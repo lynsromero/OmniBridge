@@ -15,7 +15,6 @@ use std::path::PathBuf;
 
 #[cfg(target_os = "windows")]
 fn setup_dll_path() {
-    use std::ffi::CStr;
     unsafe {
         let exe_path = std::env::current_exe().unwrap_or_default();
         let dir = exe_path.parent().unwrap_or(std::path::Path::new("."));
@@ -52,6 +51,9 @@ async fn main() -> Result<()> {
         }
         ob_cli::Commands::Status => {
             show_status()?;
+        }
+        ob_cli::Commands::Gui => {
+            run_gui()?;
         }
         ob_cli::Commands::Layout { action } => {
             handle_layout_command(action)?;
@@ -240,6 +242,30 @@ fn show_status() -> Result<()> {
     println!("================");
     println!("Config directory: {:?}", config_dir);
     println!("Layout config exists: {}", config_dir.join("layout.json").exists());
+
+    Ok(())
+}
+
+fn run_gui() -> Result<()> {
+    use ob_gui::OmniBridgeApp;
+
+    let mut app = OmniBridgeApp::new("omnibridge".to_string(), true).with_tray();
+    println!("OmniBridge GUI started. Check system tray for options.");
+
+    loop {
+        if let Some(cmd) = app.poll_tray_commands() {
+            match cmd {
+                ob_gui::TrayCommand::ShowSettings => {
+                    app.open_settings();
+                }
+                ob_gui::TrayCommand::Quit => {
+                    println!("Quitting...");
+                    break;
+                }
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
 
     Ok(())
 }

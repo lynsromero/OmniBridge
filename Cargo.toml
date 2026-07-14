@@ -38,6 +38,7 @@ ob-layout = { path = "crates/ob-layout" }
 ob-discovery = { path = "crates/ob-discovery" }
 ob-drag = { path = "crates/ob-drag" }
 ob-cli = { path = "crates/ob-cli" }
+ob-gui = { path = "crates/ob-gui" }
 tokio = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }

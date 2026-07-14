@@ -10,4 +10,4 @@ Started: 2026-07-12
 | Task 4: Server capture+stream pipeline | ✅ done | 95b6bbb | Approved |
 | Task 5: Client receive+decode+display | ✅ done | 917ea00 | Approved |
 | Task 6: UDP wiring + socket() method | ✅ done | 34b66a2 + 15428b2 | Approved |
-| Task 7: Build, verify, commit | ⬜ pending | | |
+| Task 7: Build, verify, commit | ✅ done | e208d2f | Approved |

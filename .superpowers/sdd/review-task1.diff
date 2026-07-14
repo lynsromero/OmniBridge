@@ -1,0 +1,56 @@
+# Review package: bf2b154..cb166b9
+
+## Commits
+cb166b9 fix(codec): pass through raw BGRA in stub encoder
+
+## Files changed
+ crates/ob-codec/src/encoder.rs | 19 ++++++-------------
+ 1 file changed, 6 insertions(+), 13 deletions(-)
+
+## Diff
+diff --git a/crates/ob-codec/src/encoder.rs b/crates/ob-codec/src/encoder.rs
+index d92ee24..baf3f24 100644
+--- a/crates/ob-codec/src/encoder.rs
++++ b/crates/ob-codec/src/encoder.rs
+@@ -59,35 +59,28 @@ impl VideoEncoder {
+             height: frame.metadata.height,
+             frame_number: self.frame_count,
+             is_keyframe: self.frame_count % (self.target_fps as u64 * 2) == 0,
+             timestamp_us: frame.metadata.timestamp_us,
+             encode_time_us: encode_time,
+             format: EncodedFormat::H264,
+         })
+     }
+ 
+     fn encode_software_h264(&self, frame: &CapturedFrame) -> Result<Vec<u8>> {
+-        let mut output = Vec::with_capacity(frame.pixels.len() / 4);
++        let mut output = Vec::with_capacity(20 + frame.pixels.len());
+ 
+-        output.extend_from_slice(&self.width.to_le_bytes());
+-        output.extend_from_slice(&self.height.to_le_bytes());
+-        output.extend_from_slice(&(frame.metadata.timestamp_us).to_le_bytes());
++        output.extend_from_slice(&frame.metadata.width.to_le_bytes());
++        output.extend_from_slice(&frame.metadata.height.to_le_bytes());
++        output.extend_from_slice(&frame.metadata.timestamp_us.to_le_bytes());
++        output.extend_from_slice(&(frame.pixels.len() as u32).to_le_bytes());
+ 
+-        let quality = (self.bitrate as f64 / (self.width as f64 * self.height as f64 * 3.0)) as u8;
+-        output.push(quality.min(51));
+-
+-        let skip = ((self.width as usize * self.height as usize) / output.len().max(1)).max(1);
+-        let mut i = 0;
+-        while i < frame.pixels.len() && output.len() < 65536 {
+-            output.push(frame.pixels[i]);
+-            i += skip * 4;
+-        }
++        output.extend_from_slice(&frame.pixels);
+ 
+         Ok(output)
+     }
+ 
+     pub fn frame_count(&self) -> u64 {
+         self.frame_count
+     }
+ }
+ 
+ fn detect_best_encoder() -> EncoderType {

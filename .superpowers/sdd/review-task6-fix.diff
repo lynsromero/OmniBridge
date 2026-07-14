@@ -1,0 +1,242 @@
+# Review package: 917ea00..15428b2
+
+## Commits
+15428b2 fix(client): restore InputEvent handling in UDP receive loop
+34b66a2 feat: wire UDP frame reception to client overlay display
+
+## Files changed
+ crates/ob-network/src/udp.rs |  4 ++
+ src/client.rs                | 93 ++++++++++++++++++++++++++++++++++++--------
+ src/main.rs                  | 14 ++++---
+ 3 files changed, 88 insertions(+), 23 deletions(-)
+
+## Diff
+diff --git a/crates/ob-network/src/udp.rs b/crates/ob-network/src/udp.rs
+index 8e33114..b471f99 100644
+--- a/crates/ob-network/src/udp.rs
++++ b/crates/ob-network/src/udp.rs
+@@ -36,20 +36,24 @@ impl UdpTransport {
+             message_tx: tx,
+             message_rx: Arc::new(RwLock::new(rx)),
+             buffer_size: 65536,
+         })
+     }
+ 
+     pub fn local_addr(&self) -> Result<SocketAddr> {
+         Ok(self.socket.local_addr()?)
+     }
+ 
++    pub fn socket(&self) -> &UdpSocket {
++        &*self.socket
++    }
++
+     pub async fn send_to(&self, msg: &Message, addr: SocketAddr) -> Result<()> {
+         let data = msg.serialize()?;
+         let mut buf = BytesMut::with_capacity(4 + data.len());
+         buf.put_u32_le(data.len() as u32);
+         buf.extend_from_slice(&data);
+         self.socket.send_to(&buf, addr).await?;
+         Ok(())
+     }
+ 
+     pub async fn send_to_all_peers(&self, msg: &Message) -> Result<()> {
+diff --git a/src/client.rs b/src/client.rs
+index 52298ef..219dd2b 100644
+--- a/src/client.rs
++++ b/src/client.rs
+@@ -3,79 +3,138 @@ use ob_codec::decoder::VideoDecoder;
+ use ob_core::device::DeviceInfo;
+ use ob_core::protocol::{Message, MessageType};
+ use ob_display::overlay::OverlayWindow;
+ use ob_input::InputInjector;
+ use ob_network::udp::UdpTransport;
+ use std::net::SocketAddr;
+ use std::sync::Arc;
+ use tokio::sync::mpsc;
+ use tracing::{info, warn};
+ 
++#[derive(serde::Serialize, serde::Deserialize)]
++struct VideoFramePayload {
++    source_device: ob_core::device::DeviceId,
++    width: u32,
++    height: u32,
++    timestamp_us: u64,
++    is_keyframe: bool,
++    pixels: Vec<u8>,
++}
++
+ pub async fn run_client(
+     device: DeviceInfo,
+     mut discovery_rx: mpsc::Receiver<(DeviceInfo, SocketAddr)>,
+     udp: Arc<UdpTransport>,
+ ) -> Result<()> {
+     info!("Running as client: {}", device.name);
+     println!("Client started. Waiting for server...");
+ 
+-    let injector = InputInjector::new(device.id);
++    let (overlay_tx, mut overlay_rx) = mpsc::channel::<ob_codec::decoder::DecodedFrame>(32);
++
+     let mut decoder = VideoDecoder::new();
+     let mut overlay: Option<OverlayWindow> = None;
+ 
+-    let (_msg_tx, mut msg_rx) = mpsc::channel::<(SocketAddr, Message)>(256);
+-
++    let udp_for_frames = udp.clone();
++    let injector_device_id = device.id;
+     tokio::spawn(async move {
+-        while let Some((_addr, msg)) = msg_rx.recv().await {
+-            match msg.msg_type {
+-                MessageType::InputEvent => {
+-                    if let Ok(event) =
+-                        serde_json::from_slice::<ob_core::event::InputEvent>(&msg.payload)
+-                    {
+-                        if let Err(e) = injector.inject(&event) {
+-                            warn!("Failed to inject input: {}", e);
++        let injector = InputInjector::new(injector_device_id);
++        let mut frame_buf = vec![0u8; 65536 * 4];
++        loop {
++            match udp_for_frames.socket().recv_from(&mut frame_buf).await {
++                Ok((len, _addr)) => {
++                    if len < 4 {
++                        continue;
++                    }
++                    let packet_len = u32::from_le_bytes(frame_buf[0..4].try_into().unwrap_or([0;4])) as usize;
++                    if len < 4 + packet_len || packet_len > frame_buf.len() {
++                        continue;
++                    }
++                    match Message::deserialize(&frame_buf[4..4 + packet_len]) {
++                        Ok(msg) => {
++                            match msg.msg_type {
++                                MessageType::WindowFrame => {
++                                    if let Ok(frame_data) = serde_json::from_slice::<VideoFramePayload>(&msg.payload) {
++                                        let encoded = ob_codec::encoder::EncodedFrame {
++                                            data: frame_data.pixels,
++                                            width: frame_data.width,
++                                            height: frame_data.height,
++                                            frame_number: msg.sequence,
++                                            is_keyframe: frame_data.is_keyframe,
++                                            timestamp_us: frame_data.timestamp_us,
++                                            encode_time_us: 0,
++                                            format: ob_codec::encoder::EncodedFormat::H264,
++                                        };
++                                        match decoder.decode_frame(&encoded) {
++                                            Ok(decoded) => {
++                                                let _ = overlay_tx.send(decoded).await;
++                                            }
++                                            Err(e) => {
++                                                warn!("Decode failed: {}", e);
++                                            }
++                                        }
++                                    }
++                                }
++                                MessageType::InputEvent => {
++                                    if let Ok(event) = serde_json::from_slice::<ob_core::event::InputEvent>(&msg.payload) {
++                                        if let Err(e) = injector.inject(&event) {
++                                            warn!("Failed to inject input: {}", e);
++                                        }
++                                    }
++                                }
++                                _ => {}
++                            }
+                         }
++                        _ => {}
+                     }
+                 }
+-                _ => {}
++                Err(e) => {
++                    warn!("UDP recv error: {}", e);
++                }
+             }
+         }
+     });
+ 
+     loop {
+         tokio::select! {
+             Some((new_device, addr)) = discovery_rx.recv() => {
+                 if new_device.role == ob_core::device::DeviceRole::Primary {
+                     println!("Discovered server: {} ({})", new_device.name, addr);
+                     udp.add_peer(addr).await;
+ 
+                     let handshake = Message::new(
+                         MessageType::Handshake,
+                         serde_json::to_vec(&device)?,
+                     );
+                     udp.send_to(&handshake, addr).await?;
+ 
+                     println!("Connected to server: {}", new_device.name);
+                 }
+             }
+-            _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {
+-                let clients = udp.peer_count().await;
+-                if clients > 0 && overlay.is_none() {
++            Some(decoded_frame) = overlay_rx.recv() => {
++                if overlay.is_none() {
+                     overlay = Some(OverlayWindow::new(
+                         &format!("OmniBridge - {}", device.name),
+-                        1920, 1080,
++                        decoded_frame.width, decoded_frame.height,
+                     ));
+                     println!("Overlay window created - receiving video");
+                 }
++                if let Some(ref ov) = overlay {
++                    if let Err(e) = ov.render_frame(&decoded_frame) {
++                        warn!("Render failed: {}", e);
++                    }
++                }
++            }
++            _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {
++                // Periodic tasks
+             }
+             _ = tokio::signal::ctrl_c() => {
+                 println!("\nShutting down client...");
+                 if let Some(ref ov) = overlay {
+                     ov.destroy();
+                 }
+                 break;
+             }
+         }
+     }
+ 
+     Ok(())
+-}
++}
+\ No newline at end of file
+diff --git a/src/main.rs b/src/main.rs
+index deb3310..a6c1765 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -77,26 +77,28 @@ async fn start_node(name: &str, port: u16, is_primary: bool) -> Result<()> {
+     std::thread::spawn(move || {
+         if let Err(e) = announcer.announce_loop() {
+             tracing::error!("Announcer error: {}", e);
+         }
+     });
+ 
+     let udp_addr = format!("0.0.0.0:{}", port + 1).parse()?;
+     let udp_transport = ob_network::udp::UdpTransport::bind(udp_addr).await?;
+     let udp_transport = std::sync::Arc::new(udp_transport);
+ 
+-    let udp_clone = udp_transport.clone();
+-    tokio::spawn(async move {
+-        if let Err(e) = udp_clone.run_receive_loop().await {
+-            tracing::error!("UDP receive loop error: {}", e);
+-        }
+-    });
++    if is_primary {
++        let udp_clone = udp_transport.clone();
++        tokio::spawn(async move {
++            if let Err(e) = udp_clone.run_receive_loop().await {
++                tracing::error!("UDP receive loop error: {}", e);
++            }
++        });
++    }
+ 
+     if is_primary {
+         server::run_server(local_device, listener_rx, udp_transport).await?;
+     } else {
+         client::run_client(local_device, listener_rx, udp_transport).await?;
+     }
+ 
+     Ok(())
+ }
+ 
