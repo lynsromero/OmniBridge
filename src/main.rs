@@ -13,8 +13,27 @@ use ob_discovery::mdns::DeviceDiscovery;
 use tracing::info;
 use std::path::PathBuf;
 
+#[cfg(target_os = "windows")]
+fn setup_dll_path() {
+    use std::ffi::CStr;
+    unsafe {
+        let exe_path = std::env::current_exe().unwrap_or_default();
+        let dir = exe_path.parent().unwrap_or(std::path::Path::new("."));
+        let dir_cstr = std::ffi::CString::new(dir.to_str().unwrap_or(".")).unwrap();
+        extern "system" {
+            fn SetDllDirectoryA(lpPathName: *const i8) -> i32;
+        }
+        SetDllDirectoryA(dir_cstr.as_ptr());
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn setup_dll_path() {}
+
 #[tokio::main]
 async fn main() -> Result<()> {
+    setup_dll_path();
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
