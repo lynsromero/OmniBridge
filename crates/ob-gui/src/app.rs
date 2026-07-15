@@ -1,137 +1,179 @@
-use crate::tray::{SystemTray, TrayStatus, TrayCommand};
-use ob_core::device::{DeviceInfo, DeviceRole};
-use std::sync::{mpsc, Arc, atomic::{AtomicBool, Ordering}};
-use tracing::info;
-
-pub struct OmniBridgeApp {
-    pub device_name: String,
-    pub is_primary: bool,
-    pub connected_devices: Vec<DeviceInfo>,
-    pub status: AppStatus,
-    tray: Option<SystemTray>,
-    is_settings_open: Arc<AtomicBool>,
-}
+use eframe::egui;
+use std::sync::mpsc;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum AppStatus {
-    Disconnected,
-    Connecting,
-    Connected,
+    Stopped,
+    Starting,
+    Running,
     Error(String),
 }
 
-impl AppStatus {
-    pub fn to_tray_status(&self) -> TrayStatus {
-        match self {
-            AppStatus::Disconnected => TrayStatus::Disconnected,
-            AppStatus::Connecting => TrayStatus::Connected,
-            AppStatus::Connected => TrayStatus::Connected,
-            AppStatus::Error(_) => TrayStatus::Error,
-        }
-    }
+#[derive(Debug, Clone)]
+pub struct RemoteDevice {
+    pub name: String,
+    pub address: String,
+    pub connected: bool,
+}
+
+pub struct OmniBridgeApp {
+    device_name: String,
+    is_primary: bool,
+    status: AppStatus,
+    remote_devices: Vec<RemoteDevice>,
+    command_tx: Option<mpsc::Sender<AppCommand>>,
+    event_rx: Option<mpsc::Receiver<AppEvent>>,
+}
+
+#[derive(Debug, Clone)]
+pub enum AppCommand {
+    Start { name: String, is_primary: bool },
+    Stop,
+}
+
+#[derive(Debug, Clone)]
+pub enum AppEvent {
+    Status(AppStatus),
+    DeviceFound(RemoteDevice),
 }
 
 impl OmniBridgeApp {
-    pub fn new(device_name: String, is_primary: bool) -> Self {
-        info!("Creating OmniBridge app: {} (primary={})", device_name, is_primary);
+    pub fn new(
+        command_tx: mpsc::Sender<AppCommand>,
+        event_rx: mpsc::Receiver<AppEvent>,
+    ) -> Self {
         Self {
-            device_name,
-            is_primary,
-            connected_devices: Vec::new(),
-            status: AppStatus::Disconnected,
-            tray: None,
-            is_settings_open: Arc::new(AtomicBool::new(false)),
+            device_name: hostname::get()
+                .map(|h| h.to_string_lossy().to_string())
+                .unwrap_or_else(|_| "Unknown PC".to_string()),
+            is_primary: true,
+            status: AppStatus::Stopped,
+            remote_devices: Vec::new(),
+            command_tx: Some(command_tx),
+            event_rx: Some(event_rx),
         }
     }
 
-    pub fn with_tray(mut self) -> Self {
-        self.tray = Some(SystemTray::new());
-        self
+    pub fn run_main_window(
+        command_tx: mpsc::Sender<AppCommand>,
+        event_rx: mpsc::Receiver<AppEvent>,
+    ) -> eframe::Result {
+        let native_options = eframe::NativeOptions {
+            viewport: egui::ViewportBuilder::default()
+                .with_inner_size([500.0, 400.0])
+                .with_min_inner_size([400.0, 300.0])
+                .with_title("OmniBridge"),
+            ..Default::default()
+        };
+
+        eframe::run_native(
+            "OmniBridge",
+            native_options,
+            Box::new(|_cc| Ok(Box::new(OmniBridgeApp::new(command_tx, event_rx)))),
+        )
     }
 
-    pub fn add_device(&mut self, device: DeviceInfo) {
-        self.connected_devices.push(device);
-        info!("Device added: {}", self.connected_devices.last().unwrap().name);
-        self.update_tray();
-    }
-
-    pub fn remove_device(&mut self, device_id: ob_core::device::DeviceId) {
-        self.connected_devices.retain(|d| d.id != device_id);
-        self.update_tray();
-    }
-
-    pub fn set_status(&mut self, status: AppStatus) {
-        self.status = status;
-        self.update_tray();
-    }
-
-    fn update_tray(&mut self) {
-        if let Some(ref mut tray) = self.tray {
-            tray.set_status(self.status.to_tray_status());
+    fn start_server(&mut self) {
+        if let Some(tx) = &self.command_tx {
+            let _ = tx.send(AppCommand::Start {
+                name: self.device_name.clone(),
+                is_primary: self.is_primary,
+            });
         }
     }
 
-    pub fn poll_tray_commands(&mut self) -> Option<TrayCommand> {
-        self.tray.as_ref().and_then(|tray| tray.poll_command())
-    }
-
-    pub fn open_settings(&mut self) {
-        if self.is_settings_open.load(Ordering::SeqCst) {
-            return;
+    fn stop_server(&mut self) {
+        if let Some(tx) = &self.command_tx {
+            let _ = tx.send(AppCommand::Stop);
         }
+    }
+}
 
-        self.is_settings_open.store(true, Ordering::SeqCst);
-        let (close_tx, close_rx) = mpsc::channel();
-        let app = crate::settings::SettingsApp::new(close_tx);
-
-        std::thread::spawn(move || {
-            let _ = crate::settings::run_settings(app);
-        });
-
-        let is_open = self.is_settings_open.clone();
-        std::thread::spawn(move || {
-            loop {
-                if close_rx.try_recv().is_ok() {
-                    is_open.store(false, Ordering::SeqCst);
-                    break;
+impl eframe::App for OmniBridgeApp {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        if let Some(rx) = &self.event_rx {
+            while let Ok(event) = rx.try_recv() {
+                match event {
+                    AppEvent::Status(status) => self.status = status,
+                    AppEvent::DeviceFound(device) => {
+                        if !self.remote_devices.iter().any(|d| d.address == device.address) {
+                            self.remote_devices.push(device);
+                        }
+                    }
                 }
-                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+        }
+
+        ui.heading("OmniBridge");
+        ui.separator();
+
+        ui.group(|ui| {
+            ui.label("This Device");
+            ui.horizontal(|ui| {
+                ui.label("Name:");
+                ui.text_edit_singleline(&mut self.device_name);
+            });
+            ui.horizontal(|ui| {
+                ui.label("Role:");
+                if ui.selectable_label(self.is_primary, "Primary (Server)").clicked() {
+                    self.is_primary = true;
+                }
+                if ui.selectable_label(!self.is_primary, "Secondary (Client)").clicked() {
+                    self.is_primary = false;
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.label("Status:");
+                let (color, text) = match &self.status {
+                    AppStatus::Stopped => (egui::Color32::GRAY, "Stopped"),
+                    AppStatus::Starting => (egui::Color32::YELLOW, "Starting..."),
+                    AppStatus::Running => (egui::Color32::GREEN, "Running"),
+                    AppStatus::Error(e) => (egui::Color32::RED, e.as_str()),
+                };
+                ui.colored_label(color, text);
+            });
+        });
+
+        ui.add_space(8.0);
+
+        ui.group(|ui| {
+            ui.label("Remote Devices");
+            if self.remote_devices.is_empty() {
+                ui.label("No devices discovered");
+            } else {
+                for device in &mut self.remote_devices {
+                    ui.horizontal(|ui| {
+                        let color = if device.connected {
+                            egui::Color32::GREEN
+                        } else {
+                            egui::Color32::GRAY
+                        };
+                        ui.colored_label(color, "●");
+                        ui.label(&device.name);
+                        ui.label(&device.address);
+                        if device.connected {
+                            if ui.button("Disconnect").clicked() {
+                                device.connected = false;
+                            }
+                        } else if ui.button("Connect").clicked() {
+                            device.connected = true;
+                        }
+                    });
+                }
             }
         });
-    }
 
-    pub fn render(&self) -> String {
-        let mut output = String::new();
-        output.push_str("====================================\n");
-        output.push_str("         OmniBridge v0.1.0\n");
-        output.push_str("====================================\n");
-        output.push_str(&format!("Device: {}\n", self.device_name));
-        output.push_str(&format!("Role: {}\n", if self.is_primary { "Primary" } else { "Secondary" }));
-        output.push_str(&format!("Status: {:?}\n", self.status));
-        output.push_str("------------------------------------\n");
+        ui.add_space(8.0);
 
-        if self.connected_devices.is_empty() {
-            output.push_str("No devices connected\n");
-        } else {
-            for device in &self.connected_devices {
-                output.push_str(&format!("  -> {} ({})\n", device.name, device.role_str()));
+        ui.horizontal(|ui| {
+            let running = self.status == AppStatus::Running || self.status == AppStatus::Starting;
+            if running {
+                if ui.button("Stop").clicked() {
+                    self.stop_server();
+                }
+            } else if ui.button("Start").clicked() {
+                self.start_server();
             }
-        }
-
-        output.push_str("====================================\n");
-        output
-    }
-}
-
-trait DeviceInfoExt {
-    fn role_str(&self) -> &str;
-}
-
-impl DeviceInfoExt for DeviceInfo {
-    fn role_str(&self) -> &str {
-        match self.role {
-            DeviceRole::Primary => "Primary",
-            DeviceRole::Secondary => "Secondary",
-        }
+        });
     }
 }

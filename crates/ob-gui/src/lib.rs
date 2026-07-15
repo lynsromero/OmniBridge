@@ -1,7 +1,5 @@
-pub mod tray;
-pub mod settings;
 pub mod app;
+pub mod tray;
 
-pub use tray::{SystemTray, TrayStatus, TrayCommand};
-pub use settings::{SettingsApp, SettingsEvent};
-pub use app::OmniBridgeApp;
+pub use app::{OmniBridgeApp, AppCommand, AppEvent, AppStatus, RemoteDevice};
+pub use tray::{SystemTray, TrayCommand};

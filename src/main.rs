@@ -1,3 +1,5 @@
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 mod server;
 mod client;
 mod config;
@@ -247,26 +249,107 @@ fn show_status() -> Result<()> {
 }
 
 fn run_gui() -> Result<()> {
-    use ob_gui::OmniBridgeApp;
+    use std::sync::mpsc;
+    use ob_gui::{AppCommand, AppEvent, AppStatus};
 
-    let mut app = OmniBridgeApp::new("omnibridge".to_string(), true).with_tray();
-    println!("OmniBridge GUI started. Check system tray for options.");
+    let (cmd_tx, cmd_rx) = mpsc::channel::<AppCommand>();
+    let (evt_tx, evt_rx) = mpsc::channel::<AppEvent>();
 
-    loop {
-        if let Some(cmd) = app.poll_tray_commands() {
-            match cmd {
-                ob_gui::TrayCommand::ShowSettings => {
-                    app.open_settings();
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
+        rt.block_on(async {
+            use ob_core::device::{DeviceCapabilities, DeviceInfo, DeviceId, DeviceRole};
+            use ob_core::screen::{ScreenId, ScreenInfo};
+
+            let running = false;
+
+            loop {
+                if let Ok(cmd) = cmd_rx.try_recv() {
+                    match cmd {
+                        AppCommand::Start { name, is_primary } => {
+                            if running { continue; }
+
+                            let _ = evt_tx.send(AppEvent::Status(AppStatus::Starting));
+
+                            let device_id = DeviceId::new();
+                            let role = if is_primary { DeviceRole::Primary } else { DeviceRole::Secondary };
+
+                            let local_device = DeviceInfo {
+                                id: device_id,
+                                name: name.clone(),
+                                role,
+                                host: "0.0.0.0".to_string(),
+                                quic_port: 19810,
+                                udp_port: 19811,
+                                screens: vec![ScreenInfo {
+                                    id: ScreenId(0),
+                                    name: "Display 1".to_string(),
+                                    width: 1920,
+                                    height: 1080,
+                                    x: 0,
+                                    y: 0,
+                                    scale_factor: 1.0,
+                                    is_primary: true,
+                                }],
+                                capabilities: DeviceCapabilities::default(),
+                            };
+
+                            let announcer = ob_discovery::announcer::DeviceAnnouncer::new(local_device.clone(), 19810);
+                            let discovery = ob_discovery::mdns::DeviceDiscovery::new(local_device.clone(), 19810);
+
+                            let listener_rx = match discovery.start_listener() {
+                                Ok(rx) => rx,
+                                Err(e) => {
+                                    let _ = evt_tx.send(AppEvent::Status(AppStatus::Error(e.to_string())));
+                                    continue;
+                                }
+                            };
+
+                            std::thread::spawn(move || {
+                                if let Err(e) = announcer.announce_loop() {
+                                    tracing::error!("Announcer error: {}", e);
+                                }
+                            });
+
+                            let udp_addr = "0.0.0.0:19811".parse().unwrap();
+                            let udp_transport = match ob_network::udp::UdpTransport::bind(udp_addr).await {
+                                Ok(t) => std::sync::Arc::new(t),
+                                Err(e) => {
+                                    let _ = evt_tx.send(AppEvent::Status(AppStatus::Error(e.to_string())));
+                                    continue;
+                                }
+                            };
+
+                            if is_primary {
+                                let udp_clone = udp_transport.clone();
+                                tokio::spawn(async move {
+                                    if let Err(e) = udp_clone.run_receive_loop().await {
+                                        tracing::error!("UDP receive loop error: {}", e);
+                                    }
+                                });
+                            }
+
+                            let _ = evt_tx.send(AppEvent::Status(AppStatus::Running));
+
+                            if is_primary {
+                                let _ = server::run_server(local_device, listener_rx, udp_transport).await;
+                            } else {
+                                let _ = client::run_client(local_device, listener_rx, udp_transport).await;
+                            }
+
+                            let _ = evt_tx.send(AppEvent::Status(AppStatus::Stopped));
+                        }
+                        AppCommand::Stop => {
+                            let _ = evt_tx.send(AppEvent::Status(AppStatus::Stopped));
+                        }
+                    }
                 }
-                ob_gui::TrayCommand::Quit => {
-                    println!("Quitting...");
-                    break;
-                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             }
-        }
-        std::thread::sleep(std::time::Duration::from_millis(100));
-    }
+        });
+    });
 
+    ob_gui::OmniBridgeApp::run_main_window(cmd_tx, evt_rx)?;
     Ok(())
 }
 

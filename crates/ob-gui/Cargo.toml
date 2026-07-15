@@ -13,3 +13,4 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 tray-icon = { workspace = true }
 eframe = { workspace = true }
+hostname = "0.4"
